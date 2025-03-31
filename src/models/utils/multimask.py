@@ -32,7 +32,7 @@ class PredictorMultiMaskWrapper(nn.Module):
         super().__init__()
         self.backbone = backbone
 
-    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, actions=None):
+    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, actions=None):            
         if type(ctxt) is not list:
             ctxt = [ctxt]
         if type(tgt) is not list:
@@ -44,6 +44,10 @@ class PredictorMultiMaskWrapper(nn.Module):
 
         outs = []
         for i, (zi, hi, mc, mt) in enumerate(zip(ctxt, tgt, masks_ctxt, masks_tgt)):
-            # 添加动作参数
-            outs += [self.backbone(zi, hi, mc, mt, actions=actions, mask_index=i)]
+            # 检查backbone是否接受actions参数
+            if hasattr(self.backbone, 'use_dynamics') and self.backbone.use_dynamics and actions is not None:
+                outs += [self.backbone(zi, hi, mc, mt, actions=actions, mask_index=i)]
+            else:
+                # 如果不接受actions参数，则不传递
+                outs += [self.backbone(zi, hi, mc, mt, mask_index=i)]
         return outs

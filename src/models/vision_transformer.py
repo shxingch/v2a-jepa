@@ -179,14 +179,27 @@ class VisionTransformer(nn.Module):
     def no_weight_decay(self):
         return {}
 
-    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, actions=None, mask_index=1):
+    def forward(self, x, masks=None, tgt=None, masks_ctxt=None, masks_tgt=None, actions=None, mask_index=None):
         """
         :param ctxt: context tokens
         :param tgt: target tokens
         :param masks_ctxt: indices of context tokens in input
         :params masks_tgt: indices of target tokens in input
         :param actions: (可选) 当前状态的动作 [B, action_dim]
+        :param mask_index: (可选) 当前处理的掩码索引
         """
+        if tgt is None and masks_ctxt is None and masks_tgt is None:
+            x = self.patch_embed(x)
+            if self.pos_embed is not None:
+                x = x + self.pos_embed
+            
+            for blk in self.blocks:
+                x = blk(x, mask=masks)
+            
+            if self.norm is not None:
+                x = self.norm(x)
+            
+            return x
 
         assert (masks_ctxt is not None) and (masks_tgt is not None), 'Cannot run predictor without mask indices'
         if not isinstance(masks_ctxt, list):
@@ -196,8 +209,13 @@ class VisionTransformer(nn.Module):
             masks_tgt = [masks_tgt]
 
         # Batch Size
+        ctxt = x
         B = len(ctxt) // len(masks_ctxt)
 
+        # 确保 predictor_embed 存在
+        if not hasattr(self, 'predictor_embed'):
+            raise AttributeError("模型缺少 predictor_embed 属性，请确保模型正确初始化")
+        
         # Map context tokens to pedictor dimensions
         x = self.predictor_embed(ctxt)
         _, N_ctxt, D = x.shape  # 这里定义了N_ctxt
@@ -231,6 +249,10 @@ class VisionTransformer(nn.Module):
 
         if self.norm is not None:
             x = self.norm(x)
+        
+        # 确保 predictor_norm 和 predictor_proj 存在
+        if not hasattr(self, 'predictor_norm') or not hasattr(self, 'predictor_proj'):
+            raise AttributeError("模型缺少 predictor_norm 或 predictor_proj 属性，请确保模型正确初始化")
         
         # 在预测器处理后，如果使用动态模型且提供了动作，则应用动态模型
         if self.use_dynamics and actions is not None:

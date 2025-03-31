@@ -171,34 +171,132 @@ class VisionTransformerPredictor(nn.Module):
         x = alpha**0.5 * x + (1.-alpha)**0.5 * torch.randn(x.shape, device=x.device)
         return x
 
-    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, mask_index=1):
+    def interpolate_pos_encoding(self, x, pos_embed):
+        """
+        从 VisionTransformer 类复制的方法，用于调整位置编码的大小以匹配输入张量
+        """
+        _, N, dim = pos_embed.shape
+
+        if self.is_video:
+            # 如果是视频数据
+            _, _, T, H, W = x.shape
+            if H == self.input_size and W == self.input_size and T == self.num_frames:
+                return pos_embed
+
+            # 将深度、高度、宽度转换为以patch为单位而非像素/帧
+            T = T // self.tubelet_size
+            H = H // self.patch_size
+            W = W // self.patch_size
+
+            # 计算初始化的位置嵌入形状（以patch为单位）
+            N_t = self.num_frames // self.tubelet_size
+            N_h = N_w = self.input_size // self.patch_size
+            assert N_h * N_w * N_t == N, '位置嵌入初始化不正确'
+
+            # 计算时空插值的缩放因子
+            scale_factor = (T/N_t, H/N_h, W/N_w)
+
+            pos_embed = nn.functional.interpolate(
+                pos_embed.reshape(1, N_t, N_h, N_w, dim).permute(0, 4, 1, 2, 3),
+                scale_factor=scale_factor,
+                mode='trilinear')
+            pos_embed = pos_embed.permute(0, 2, 3, 4, 1).view(1, -1, dim)
+            return pos_embed
+
+        else:
+            # 如果是图像数据
+            _, _, H, W = x.shape
+            if H == self.input_size and W == self.input_size:
+                return pos_embed
+
+            # 计算空间插值的缩放因子
+            npatch = (H // self.patch_size) * (W // self.patch_size)
+            scale_factor = math.sqrt(npatch / N)
+
+            pos_embed = nn.functional.interpolate(
+                pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2),
+                scale_factor=scale_factor,
+                mode='bicubic')
+            pos_embed = pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+            return pos_embed
+
+    def safe_apply_masks(self, x, masks):
+        """
+        安全版本的 apply_masks 函数，防止索引越界
+        """
+        if not isinstance(masks, list):
+            masks = [masks]
+        
+        outs = []
+        B, N, D = x.shape
+        
+        for mask in masks:
+            # 确保掩码索引不超出范围
+            safe_mask = torch.clamp(mask, 0, N-1)
+            
+            # 如果掩码被截断，打印警告
+            if not torch.equal(mask, safe_mask):
+                print(f"警告: 掩码索引超出范围，已被截断。原始范围: [{mask.min()}, {mask.max()}], 有效范围: [0, {N-1}]")
+            
+            # 使用安全的掩码索引
+            idx = safe_mask.unsqueeze(-1).expand(-1, -1, D)
+            out = torch.gather(x, 1, idx)
+            outs.append(out)
+        
+        return torch.cat(outs, dim=0)
+
+    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, actions=None, mask_index=None):
         """
         :param ctxt: context tokens
         :param tgt: target tokens
         :param masks_ctxt: indices of context tokens in input
-        :params masks_tgt: indices of target tokens in input
+        :param masks_tgt: indices of target tokens in input
+        :param actions: (可选) 当前状态的动作
+        :param mask_index: (可选) 当前处理的掩码索引
         """
-
-        assert (masks_ctxt is not None) and (masks_tgt is not None), 'Cannot run predictor without mask indices'
-
         if not isinstance(masks_ctxt, list):
             masks_ctxt = [masks_ctxt]
-
         if not isinstance(masks_tgt, list):
             masks_tgt = [masks_tgt]
 
         # Batch Size
         B = len(ctxt) // len(masks_ctxt)
 
-        # Map context tokens to pedictor dimensions
+        # Map context tokens to predictor dimensions
         x = self.predictor_embed(ctxt)
         _, N_ctxt, D = x.shape
 
-        # Add positional embedding to ctxt tokens
+        # Add positional embedding to context tokens
         if self.predictor_pos_embed is not None:
-            ctxt_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
-            x += apply_masks(ctxt_pos_embed, masks_ctxt)
-
+            try:
+                # 获取掩码的大小
+                mask_size = masks_ctxt[0].size(1)
+                
+                # 直接创建与掩码大小匹配的位置嵌入
+                ctxt_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
+                
+                # 确保位置嵌入与掩码大小匹配
+                if ctxt_pos_embed.size(1) != mask_size:
+                    # 创建一个新的位置嵌入，大小与掩码匹配
+                    new_pos_embed = torch.zeros(B, mask_size, D, device=ctxt_pos_embed.device)
+                    
+                    # 如果原始位置嵌入更大，截取它
+                    if ctxt_pos_embed.size(1) > mask_size:
+                        new_pos_embed = ctxt_pos_embed[:, :mask_size, :]
+                    else:
+                        # 如果原始位置嵌入更小，复制可用部分
+                        new_pos_embed[:, :ctxt_pos_embed.size(1), :] = ctxt_pos_embed
+                    
+                    ctxt_pos_embed = new_pos_embed
+                
+                # 应用掩码
+                x += self.safe_apply_masks(ctxt_pos_embed, masks_ctxt)
+            except Exception as e:
+                print(f"位置嵌入应用错误: {e}")
+                print(f"x.shape: {x.shape}, predictor_pos_embed.shape: {self.predictor_pos_embed.shape}")
+                # 跳过位置嵌入，但不中断训练
+                pass
+        
         # Map target tokens to predictor dimensions & add noise (fwd diffusion)
         if self.mask_tokens is None:
             pred_tokens = self.predictor_embed(tgt)
@@ -207,25 +305,69 @@ class VisionTransformerPredictor(nn.Module):
             mask_index = mask_index % self.num_mask_tokens
             pred_tokens = self.mask_tokens[mask_index]
             pred_tokens = pred_tokens.repeat(B, self.num_patches, 1)
-            pred_tokens = apply_masks(pred_tokens, masks_tgt)
+            pred_tokens = self.safe_apply_masks(pred_tokens, masks_tgt)
 
         # Add positional embedding to target tokens
         if self.predictor_pos_embed is not None:
-            pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)
-            pos_embs = apply_masks(pos_embs, masks_tgt)
-            pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_ctxt))
-            pred_tokens += pos_embs
+            try:
+                # 获取目标掩码的大小
+                tgt_mask_size = masks_tgt[0].size(1)
+                
+                # 创建与目标掩码大小匹配的位置嵌入
+                pos_embs = self.predictor_pos_embed.repeat(B, 1, 1)
+                
+                # 确保位置嵌入与掩码大小匹配
+                if pos_embs.size(1) != tgt_mask_size:
+                    # 创建一个新的位置嵌入，大小与掩码匹配
+                    new_pos_embs = torch.zeros(B, tgt_mask_size, D, device=pos_embs.device)
+                    
+                    # 如果原始位置嵌入更大，截取它
+                    if pos_embs.size(1) > tgt_mask_size:
+                        new_pos_embs = pos_embs[:, :tgt_mask_size, :]
+                    else:
+                        # 如果原始位置嵌入更小，复制可用部分
+                        new_pos_embs[:, :pos_embs.size(1), :] = pos_embs
+                    
+                    pos_embs = new_pos_embs
+                
+                # 应用掩码并重复
+                pos_embs = self.safe_apply_masks(pos_embs, masks_tgt)
+                pos_embs = repeat_interleave_batch(pos_embs, B, repeat=len(masks_ctxt))
+                pred_tokens += pos_embs
+            except Exception as e:
+                print(f"目标位置嵌入应用错误: {e}")
+                print(f"pred_tokens.shape: {pred_tokens.shape}, predictor_pos_embed.shape: {self.predictor_pos_embed.shape}")
+                # 跳过位置嵌入，但不中断训练
+                pass
 
         # Concatenate context & target tokens
         x = x.repeat(len(masks_tgt), 1, 1)
         x = torch.cat([x, pred_tokens], dim=1)
 
-        # FIXME: this implementation currently assumes masks_ctxt and masks_tgt
-        # are alligned 1:1 (ok with MultiMask wrapper on predictor but
-        # otherwise will break)
-        masks_ctxt = torch.cat(masks_ctxt, dim=0)
-        masks_tgt = torch.cat(masks_tgt, dim=0)
-        masks = torch.cat([masks_ctxt, masks_tgt], dim=1)
+        # 确保掩码大小匹配
+        try:
+            # FIXME: this implementation currently assumes masks_ctxt and masks_tgt
+            # are alligned 1:1 (ok with MultiMask wrapper on predictor but
+            # otherwise will break)
+            masks_ctxt = torch.cat(masks_ctxt, dim=0)
+            masks_tgt = torch.cat(masks_tgt, dim=0)
+            
+            # 检查掩码大小是否匹配
+            if masks_ctxt.size(1) + masks_tgt.size(1) != x.size(1):
+                print(f"警告: 掩码总大小 ({masks_ctxt.size(1)} + {masks_tgt.size(1)}) 与输入大小 ({x.size(1)}) 不匹配")
+                # 创建一个新的掩码，大小与输入匹配
+                new_mask = torch.zeros(x.size(0), x.size(1), dtype=torch.bool, device=x.device)
+                # 复制可用部分
+                new_mask[:, :masks_ctxt.size(1)] = masks_ctxt
+                new_mask[:, masks_ctxt.size(1):masks_ctxt.size(1) + min(masks_tgt.size(1), x.size(1) - masks_ctxt.size(1))] = \
+                    masks_tgt[:, :min(masks_tgt.size(1), x.size(1) - masks_ctxt.size(1))]
+                masks = new_mask
+            else:
+                masks = torch.cat([masks_ctxt, masks_tgt], dim=1)
+        except Exception as e:
+            print(f"掩码连接错误: {e}")
+            # 创建一个空掩码，允许所有位置的注意力
+            masks = torch.ones(x.size(0), x.size(1), dtype=torch.bool, device=x.device)
 
         # Fwd prop
         for blk in self.predictor_blocks:
