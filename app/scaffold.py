@@ -14,8 +14,15 @@ logger = logging.getLogger()
 
 
 def main(app, args, resume_preempt=False):
-
-    logger.info(f'Running pre-training of app: {app}')
-    return importlib.import_module(f'app.{app}.train').main(
-        args=args,
-        resume_preempt=resume_preempt)
+    task = args.get('task', 'train')  # 默认为训练任务
+    
+    if task == 'finetune':
+        logger.info(f'Running fine-tuning of app: {app}')
+        return importlib.import_module(f'app.{app}.finetune').main(
+            args=args,
+            resume_preempt=resume_preempt)
+    else:
+        logger.info(f'Running pre-training of app: {app}')
+        return importlib.import_module(f'app.{app}.train').main(
+            args=args,
+            resume_preempt=resume_preempt)

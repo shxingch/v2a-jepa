@@ -69,6 +69,7 @@ def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
 
     # -- META
+    print("-------------------------------- finetune -------------------------------")
     cfgs_meta = args.get('meta')
     load_model = cfgs_meta.get('load_checkpoint') or resume_preempt
     r_file = cfgs_meta.get('read_checkpoint', None)
@@ -275,26 +276,6 @@ def main(args, resume_preempt=False):
     if ipe is None:
         ipe = _dlen
     logger.info(f'iterations per epoch/dataest length: {ipe}/{_dlen}')
-    
-    # 在init_opt函数调用前添加冻结逻辑
-    if 'finetune' in args and args['finetune'].get('freeze_layers', 0) > 0:
-        freeze_layers = args['finetune']['freeze_layers']
-        logger.info(f'Freezing first {freeze_layers} encoder layers for fine-tuning')
-        
-        # 冻结编码器的前几层
-        for name, param in encoder.named_parameters():
-            if 'backbone.blocks.' in name:
-                block_num = int(name.split('.')[2])
-                if block_num < freeze_layers:
-                    param.requires_grad = False
-                    logger.info(f'Freezing parameter: {name}')
-        
-        # 如果不想训练掩码令牌，也可以冻结它们
-        if not args['finetune'].get('train_mask_tokens', True):
-            for name, param in predictor.named_parameters():
-                if 'mask_tokens' in name:
-                    param.requires_grad = False
-                    logger.info(f'Freezing parameter: {name}')
 
     # -- init optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
