@@ -18,70 +18,108 @@ import src.models.predictor as vit_pred
 from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper
 from src.utils.schedulers import (
     WarmupCosineSchedule,
-    CosineWDSchedule)
+    CosineWDSchedule,
+    )
 from src.utils.tensors import trunc_normal_
+
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
 
-def load_checkpoint(
-    r_path,
-    encoder,
-    predictor,
-    target_encoder,
-    opt,
-    scaler,
-):
+# 在utils.py中添加或修改load_checkpoint函数
+def load_checkpoint(r_path, encoder, predictor, target_encoder, opt, scaler, action_predictor=None):
+    """ Load checkpoint from file.
+    
+    Args:
+        r_path (str): path to checkpoint file
+        encoder (nn.Module): encoder model
+        predictor (nn.Module): predictor model
+        target_encoder (nn.Module): target encoder model
+        opt (optim.Optimizer): optimizer
+        scaler (amp.GradScaler): gradient scaler
+        action_predictor (nn.Module, optional): action predictor model
+        
+    Returns:
+        encoder (nn.Module): loaded encoder model
+        predictor (nn.Module): loaded predictor model
+        target_encoder (nn.Module): loaded target encoder model
+        action_predictor (nn.Module): loaded action predictor model
+        opt (optim.Optimizer): loaded optimizer
+        scaler (amp.GradScaler): loaded gradient scaler
+        epoch (int): epoch of the loaded checkpoint
+    """
     try:
-        checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
+        checkpoint = torch.load(r_path, map_location='cpu')
     except Exception as e:
-        logger.info(f'Encountered exception when loading checkpoint {e}')
+        logger.info(f'Unable to load checkpoint from {r_path}; {e}')
+        return encoder, predictor, target_encoder, action_predictor, opt, scaler, 0
 
-    epoch = 0
-    try:
-        epoch = checkpoint['epoch']
+    if 'encoder' in checkpoint:
+        logger.info(f'Loading encoder from {r_path}')
+        try:
+            encoder.load_state_dict(checkpoint['encoder'], strict=True)
+        except Exception as e:
+            logger.info(f'Unable to load encoder weights: {e}.')
+            logger.info('Continuing with random encoder weights.')
+    else:
+        logger.info(f'No encoder weights available, continuing with random init.')
 
-        # -- loading encoder
-        pretrained_dict = checkpoint['encoder']
-        msg = encoder.load_state_dict(pretrained_dict)
-        logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
+    if 'predictor' in checkpoint:
+        logger.info(f'Loading predictor from {r_path}')
+        try:
+            predictor.load_state_dict(checkpoint['predictor'], strict=True)
+        except Exception as e:
+            logger.info(f'Unable to load predictor weights: {e}.')
+            logger.info('Continuing with random predictor weights.')
+    else:
+        logger.info(f'No predictor weights available, continuing with random init.')
 
-        # -- loading predictor
-        pretrained_dict = checkpoint['predictor']
-        msg = predictor.load_state_dict(pretrained_dict)
-        logger.info(f'loaded pretrained predictor from epoch {epoch} with msg: {msg}')
+    if 'target_encoder' in checkpoint:
+        logger.info(f'Loading target_encoder from {r_path}')
+        try:
+            target_encoder.load_state_dict(checkpoint['target_encoder'], strict=True)
+        except Exception as e:
+            logger.info(f'Unable to load target_encoder weights: {e}.')
+            logger.info('Continuing with random target_encoder weights.')
+    else:
+        logger.info(f'No target_encoder weights available, continuing with random init.')
+    
+    # 加载动作预测器
+    if action_predictor is not None and 'action_predictor' in checkpoint:
+        logger.info(f'Loading action_predictor from {r_path}')
+        try:
+            action_predictor.load_state_dict(checkpoint['action_predictor'], strict=True)
+        except Exception as e:
+            logger.info(f'Unable to load action_predictor weights: {e}.')
+            logger.info('Continuing with random action_predictor weights.')
+    elif action_predictor is not None:
+        logger.info(f'No action_predictor weights available, continuing with random init.')
 
-        # -- loading target_encoder
-        if target_encoder is not None:
-            print(list(checkpoint.keys()))
-            pretrained_dict = checkpoint['target_encoder']
-            msg = target_encoder.load_state_dict(pretrained_dict)
-            logger.info(
-                f'loaded pretrained target encoder from epoch {epoch} with msg: {msg}'
-            )
+    if 'opt' in checkpoint:
+        logger.info(f'Loading optimizer from {r_path}')
+        try:
+            opt.load_state_dict(checkpoint['opt'])
+        except Exception as e:
+            logger.info(f'Unable to load optimizer: {e}.')
+    else:
+        logger.info(f'No optimizer state available, continuing with random init.')
 
-        # -- loading optimizer
-        opt.load_state_dict(checkpoint['opt'])
-        if scaler is not None:
+    if 'scaler' in checkpoint and scaler is not None and checkpoint['scaler'] is not None:
+        logger.info(f'Loading scaler from {r_path}')
+        try:
             scaler.load_state_dict(checkpoint['scaler'])
-        logger.info(f'loaded optimizers from epoch {epoch}')
-        logger.info(f'read-path: {r_path}')
-        del checkpoint
+        except Exception as e:
+            logger.info(f'Unable to load scaler: {e}.')
+    else:
+        logger.info(f'No scaler state available, continuing with default init.')
 
-    except Exception as e:
-        logger.info(f'Encountered exception when loading checkpoint {e}')
-        epoch = 0
+    start_epoch = 0
+    if 'epoch' in checkpoint:
+        start_epoch = checkpoint['epoch']
+        logger.info(f'Will start from epoch {start_epoch}')
 
-    return (
-        encoder,
-        predictor,
-        target_encoder,
-        opt,
-        scaler,
-        epoch,
-    )
-
+    return encoder, predictor, target_encoder, action_predictor, opt, scaler, start_epoch
 
 def init_video_model(
     device,
@@ -152,59 +190,134 @@ def init_video_model(
 
     return encoder, predictor
 
-
-def init_opt(
-    encoder,
-    predictor,
-    iterations_per_epoch,
-    start_lr,
-    ref_lr,
-    warmup,
-    num_epochs,
-    wd=1e-6,
-    final_wd=1e-6,
-    final_lr=0.0,
-    mixed_precision=False,
-    ipe_scale=1.25,
-    betas=(0.9, 0.999),
-    eps=1e-8,
-    zero_init_bias_wd=True,
-):
+def init_opt(encoder, predictor, wd, final_wd, start_lr, ref_lr, final_lr, iterations_per_epoch, warmup, num_epochs, ipe_scale, mixed_precision, betas, eps, action_predictor=None):
+    # 合并所有参数
     param_groups = [
-        {
-            'params': (p for n, p in encoder.named_parameters()
-                       if ('bias' not in n) and (len(p.shape) != 1))
-        }, {
-            'params': (p for n, p in predictor.named_parameters()
-                       if ('bias' not in n) and (len(p.shape) != 1))
-        }, {
-            'params': (p for n, p in encoder.named_parameters()
-                       if ('bias' in n) or (len(p.shape) == 1)),
-            'WD_exclude': zero_init_bias_wd,
-            'weight_decay': 0,
-        }, {
-            'params': (p for n, p in predictor.named_parameters()
-                       if ('bias' in n) or (len(p.shape) == 1)),
-            'WD_exclude': zero_init_bias_wd,
-            'weight_decay': 0,
-        },
+        {'params': [p for p in encoder.parameters() if p.requires_grad]},
+        {'params': [p for p in predictor.parameters() if p.requires_grad]},
     ]
-
-    logger.info('Using AdamW')
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
+    
+    # 添加动作预测器参数
+    if action_predictor is not None:
+        param_groups.append({'params': [p for p in action_predictor.parameters() if p.requires_grad]})
+    
+    # 创建优化器
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        betas=betas,
+        lr=start_lr,
+        weight_decay=wd,
+        eps=eps)
+    
+    # 创建学习率调度器
     scheduler = WarmupCosineSchedule(
         optimizer,
-        warmup_steps=int(warmup * iterations_per_epoch),
+        warmup_steps=warmup * iterations_per_epoch,
         start_lr=start_lr,
         ref_lr=ref_lr,
-        final_lr=final_lr,
-        T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
+        T_max=num_epochs * iterations_per_epoch * ipe_scale,
+        final_lr=final_lr
     )
+    
+    # 创建权重衰减调度器
     wd_scheduler = CosineWDSchedule(
         optimizer,
         ref_wd=wd,
-        final_wd=final_wd,
-        T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
+        T_max=num_epochs * iterations_per_epoch * ipe_scale,
+        final_wd=final_wd
     )
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+    
+    # 创建梯度缩放器
+    if mixed_precision:
+        scaler = torch.cuda.amp.GradScaler()
+    else:
+        scaler = None
+    
     return optimizer, scaler, scheduler, wd_scheduler
+
+# def init_opt(
+#     encoder,
+#     predictor,
+#     iterations_per_epoch,
+#     start_lr,
+#     ref_lr,
+#     warmup,
+#     num_epochs,
+#     wd=1e-6,
+#     final_wd=1e-6,
+#     final_lr=0.0,
+#     mixed_precision=False,
+#     ipe_scale=1.25,
+#     betas=(0.9, 0.999),
+#     eps=1e-8,
+#     zero_init_bias_wd=True,
+# ):
+#     param_groups = [
+#         {
+#             'params': (p for n, p in encoder.named_parameters()
+#                        if ('bias' not in n) and (len(p.shape) != 1))
+#         }, {
+#             'params': (p for n, p in predictor.named_parameters()
+#                        if ('bias' not in n) and (len(p.shape) != 1))
+#         }, {
+#             'params': (p for n, p in encoder.named_parameters()
+#                        if ('bias' in n) or (len(p.shape) == 1)),
+#             'WD_exclude': zero_init_bias_wd,
+#             'weight_decay': 0,
+#         }, {
+#             'params': (p for n, p in predictor.named_parameters()
+#                        if ('bias' in n) or (len(p.shape) == 1)),
+#             'WD_exclude': zero_init_bias_wd,
+#             'weight_decay': 0,
+#         },
+#     ]
+
+#     logger.info('Using AdamW')
+#     optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
+#     scheduler = WarmupCosineSchedule(
+#         optimizer,
+#         warmup_steps=int(warmup * iterations_per_epoch),
+#         start_lr=start_lr,
+#         ref_lr=ref_lr,
+#         final_lr=final_lr,
+#         T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
+#     )
+#     wd_scheduler = CosineWDSchedule(
+#         optimizer,
+#         ref_wd=wd,
+#         final_wd=final_wd,
+#         T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
+#     )
+#     scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+#     return optimizer, scaler, scheduler, wd_scheduler
+
+# 在文件末尾添加
+def init_libero_model(encoder, action_predictor_cfg, device=None):
+    """
+    初始化Libero模型，添加动作预测头到V-JEPA编码器
+    
+    Args:
+        encoder: V-JEPA编码器模型
+        action_predictor_cfg: 动作预测头配置
+        device: 使用的设备
+        
+    Returns:
+        action_predictor: 动作预测模型
+    """
+    from src.models.action_predictor import ActionPredictor
+    
+    # 获取编码器输出维度
+    encoder_output_dim = encoder.backbone.embed_dim
+    
+    # 创建动作预测头
+    action_predictor = ActionPredictor(
+        input_dim=encoder_output_dim,
+        hidden_dim=action_predictor_cfg.get('hidden_dim', 512),
+        output_dim=action_predictor_cfg.get('output_dim', 7),
+        num_layers=action_predictor_cfg.get('num_layers', 2)
+    )
+    
+    if device is not None:
+        action_predictor = action_predictor.to(device)
+        
+    return action_predictor

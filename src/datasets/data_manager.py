@@ -6,6 +6,8 @@
 #
 
 from logging import getLogger
+from src.datasets.libero_dataset import make_liberodataset
+
 
 
 _GLOBAL_SEED = 0
@@ -43,6 +45,7 @@ def init_data(
     repeat_wds=False,
     ipe=300,
     log_dir=None,
+    view_type='agentview',  # 用于Libero数据集，选择视角类型
 ):
 
     if (data.lower() == 'imagenet') \
@@ -87,5 +90,21 @@ def init_data(
             rank=rank,
             drop_last=drop_last,
             log_dir=log_dir)
+    
+    elif data.lower() == 'libero':
+        dataset, data_loader, dist_sampler = make_liberodataset(
+            data_dir=root_path,
+            batch_size=batch_size,
+            num_frames=clip_len,
+            frame_skip=frame_sample_rate,
+            transform=transform,
+            view_type=view_type,
+            collator=collator,
+            num_workers=num_workers,
+            world_size=world_size,
+            rank=rank,
+            drop_last=drop_last,
+            pin_memory=pin_mem,
+            persistent_workers=persistent_workers)
 
     return (data_loader, dist_sampler)

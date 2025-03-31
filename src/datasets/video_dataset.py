@@ -45,20 +45,36 @@ def make_videodataset(
     pin_mem=True,
     duration=None,
     log_dir=None,
+    decode_one_clip=True,
 ):
-    dataset = VideoDataset(
-        data_paths=data_paths,
-        datasets_weights=datasets_weights,
-        frames_per_clip=frames_per_clip,
-        frame_step=frame_step,
-        num_clips=num_clips,
-        random_clip_sampling=random_clip_sampling,
-        allow_clip_overlap=allow_clip_overlap,
-        filter_short_videos=filter_short_videos,
-        filter_long_videos=filter_long_videos,
-        duration=duration,
-        shared_transform=shared_transform,
-        transform=transform)
+    is_libero = any(path.endswith('libero_files.csv') for path in data_paths)
+    if is_libero:
+        dataset = LiberoVideoDataset(
+            csv_file=data_paths[0],
+            frames_per_clip=frames_per_clip,
+            frame_step=frame_step,
+            transform=transform,
+            num_clips=num_clips,
+            random_clip_sampling=random_clip_sampling,
+            allow_clip_overlap=allow_clip_overlap,
+            decode_one_clip=decode_one_clip,
+        )
+        
+    else:
+
+        dataset = VideoDataset(
+            data_paths=data_paths,
+            datasets_weights=datasets_weights,
+            frames_per_clip=frames_per_clip,
+            frame_step=frame_step,
+            num_clips=num_clips,
+            random_clip_sampling=random_clip_sampling,
+            allow_clip_overlap=allow_clip_overlap,
+            filter_short_videos=filter_short_videos,
+            filter_long_videos=filter_long_videos,
+            duration=duration,
+            shared_transform=shared_transform,
+            transform=transform)
 
     logger.info('VideoDataset dataset created')
     if datasets_weights is not None:
@@ -270,3 +286,102 @@ class VideoDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.samples)
+# 添加到src/datasets/video_dataset.py
+
+class LiberoVideoDataset(torch.utils.data.Dataset):
+    """
+    用于加载Libero HDF5视频数据的数据集
+    """
+    def __init__(
+        self,
+        csv_file,
+        frames_per_clip=16,
+        frame_step=4,
+        transform=None,
+        num_clips=1,
+        clip_duration=None,
+        random_clip_sampling=True,
+        allow_clip_overlap=False,
+        decode_one_clip=True,
+    ):
+        self.csv_file = csv_file
+        self.frames_per_clip = frames_per_clip
+        self.frame_step = frame_step
+        self.transform = transform
+        self.num_clips = num_clips
+        self.random_clip_sampling = random_clip_sampling
+        self.allow_clip_overlap = allow_clip_overlap
+        self.decode_one_clip = decode_one_clip
+        
+        # 读取CSV文件
+        self.files = []
+        with open(csv_file, 'r') as f:
+            for line in f:
+                file_path, _ = line.strip().split()
+                self.files.append(file_path)
+                
+        print(f"Loaded {len(self.files)} HDF5 files for training")
+        
+        # 建立索引映射
+        self.demo_mapping = []  # (file_idx, demo_idx, start_idx)
+        
+        for file_idx, file_path in enumerate(self.files):
+            try:
+                with h5py.File(file_path, 'r') as f:
+                    demos = list(f['data'].keys())
+                    for demo_idx, demo_key in enumerate(demos):
+                        # 获取演示长度
+                        seq_length = f['data'][demo_key]['actions'].shape[0]
+                        
+                        # 计算可能的起始帧
+                        max_start_idx = seq_length - frames_per_clip * frame_step
+                        
+                        if max_start_idx > 0:
+                            # 添加每个演示的多个片段
+                            stride = max(1, max_start_idx // 5)  # 每个演示最多5个片段
+                            for start_idx in range(0, max_start_idx, stride):
+                                self.demo_mapping.append((file_idx, demo_key, start_idx))
+            except Exception as e:
+                print(f"Error loading {file_path}: {e}")
+                
+        print(f"Created {len(self.demo_mapping)} video clips from {len(self.files)} HDF5 files")
+    
+    def __len__(self):
+        return len(self.demo_mapping)
+    
+    def __getitem__(self, idx):
+        file_idx, demo_key, start_idx = self.demo_mapping[idx]
+        file_path = self.files[file_idx]
+        
+        with h5py.File(file_path, 'r') as f:
+            demo_data = f['data'][demo_key]
+            
+            # 提取视频帧
+            frames = []
+            for i in range(self.frames_per_clip):
+                frame_idx = start_idx + i * self.frame_step
+                # 第三人称视图
+                frame = demo_data['obs']['agentview_rgb'][frame_idx]
+                frames.append(frame)
+            
+            # 提取对应的动作
+            actions = []
+            for i in range(self.frames_per_clip):
+                frame_idx = start_idx + i * self.frame_step
+                action = demo_data['actions'][frame_idx]
+                actions.append(action)
+            
+            # 转换为PyTorch张量
+            frames = np.stack(frames)  # (T, H, W, C)
+            frames = torch.from_numpy(frames).permute(0, 3, 1, 2).float() / 255.0  # (T, C, H, W)
+            
+            # 应用变换
+            if self.transform is not None:
+                frames = self.transform(frames)
+            
+            # 正确格式化动作数据
+            actions = np.stack(actions)
+            actions = torch.from_numpy(actions).float()
+            
+            # 返回元组 (clips, class_idx)，保持与VideoDataset兼容
+            return ([frames], 0)  # 类标签为0，在预训练中不使用
