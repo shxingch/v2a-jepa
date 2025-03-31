@@ -425,8 +425,14 @@ def main(args, resume_preempt=False):
                     _masks_enc.append(_me)
                     _masks_pred.append(_mp)
 
-                return (clips, _masks_enc, _masks_pred)
-            clips, masks_enc, masks_pred = load_clips()
+                actions = None
+                if len(udata) > 3:  # 检查是否包含动作数据
+                    actions = [a.to(device, non_blocking=True) for a in udata[3]]
+                    # 如果有多个clip，可能需要调整动作的形状
+                    if num_clips > 1:
+                        actions = torch.cat(actions, dim=0)
+                return (clips, _masks_enc, _masks_pred, actions)
+            clips, masks_enc, masks_pred, actions = load_clips()
 
             for _i, m in enumerate(mask_meters):
                 m.update(masks_enc[_i][0].size(-1))
@@ -454,7 +460,7 @@ def main(args, resume_preempt=False):
                     mask-pred.
                     """
                     z = encoder(c, masks_enc)
-                    z = predictor(z, h, masks_enc, masks_pred)
+                    z = predictor(z, h, masks_enc, masks_pred, actions=actions)
                     return z
 
                 def loss_fn(z, h):

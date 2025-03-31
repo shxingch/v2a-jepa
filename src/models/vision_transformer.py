@@ -16,6 +16,8 @@ from src.models.utils.modules import Block
 from src.models.utils.pos_embs import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
 from src.utils.tensors import trunc_normal_
 from src.masks.utils import apply_masks
+from src.models.dynamics_model import DynamicsModel
+
 
 
 class VisionTransformer(nn.Module):
@@ -28,6 +30,7 @@ class VisionTransformer(nn.Module):
         tubelet_size=2,
         in_chans=3,
         embed_dim=768,
+        predictor_embed_dim=384,
         depth=12,
         num_heads=12,
         mlp_ratio=4.0,
@@ -39,6 +42,14 @@ class VisionTransformer(nn.Module):
         init_std=0.02,
         out_layers=None,
         uniform_power=False,
+        use_mask_tokens=False,
+        num_mask_tokens=2,
+        zero_init_mask_tokens=True,
+        use_dynamics=False,
+        action_dim=0,
+        dynamics_type="mlp",
+        dynamics_hidden_dim=256,
+        dynamics_layers=2,
         **kwargs
     ):
         super().__init__()
@@ -108,6 +119,18 @@ class VisionTransformer(nn.Module):
         self.init_std = init_std
         self.apply(self._init_weights)
         self._rescale_blocks()
+        
+        self.use_dynamics = use_dynamics
+        self.action_dim = action_dim
+        
+        if use_dynamics:
+            self.dynamics_model = DynamicsModel(
+                state_dim=predictor_embed_dim,
+                action_dim=action_dim,
+                hidden_dim=dynamics_hidden_dim,
+                model_type=dynamics_type,
+                num_layers=dynamics_layers,
+            )
 
     def _init_pos_embed(self, pos_embed):
         embed_dim = pos_embed.size(-1)
@@ -156,12 +179,29 @@ class VisionTransformer(nn.Module):
     def no_weight_decay(self):
         return {}
 
-    def forward(self, x, masks=None):
+    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, actions=None, mask_index=1):
         """
-        :param x: input image/video
-        :param masks: indices of patch tokens to mask (remove)
+        :param ctxt: context tokens
+        :param tgt: target tokens
+        :param masks_ctxt: indices of context tokens in input
+        :params masks_tgt: indices of target tokens in input
+        :param actions: (可选) 当前状态的动作 [B, action_dim]
         """
 
+        assert (masks_ctxt is not None) and (masks_tgt is not None), 'Cannot run predictor without mask indices'
+        if not isinstance(masks_ctxt, list):
+            masks_ctxt = [masks_ctxt]
+
+        if not isinstance(masks_tgt, list):
+            masks_tgt = [masks_tgt]
+
+        # Batch Size
+        B = len(ctxt) // len(masks_ctxt)
+
+        # Map context tokens to pedictor dimensions
+        x = self.predictor_embed(ctxt)
+        _, N_ctxt, D = x.shape  # 这里定义了N_ctxt
+        
         if masks is not None and not isinstance(masks, list):
             masks = [masks]
 
@@ -191,6 +231,24 @@ class VisionTransformer(nn.Module):
 
         if self.norm is not None:
             x = self.norm(x)
+        
+        # 在预测器处理后，如果使用动态模型且提供了动作，则应用动态模型
+        if self.use_dynamics and actions is not None:
+            # 获取上下文特征
+            x_context = x[:, :N_ctxt]
+            
+            # 应用动态模型预测下一状态
+            x_pred_dynamic = self.dynamics_model(x_context, actions)
+            
+            # 与原始预测合并（可以有不同的合并策略）
+            alpha = 0.5  # 混合权重，可配置
+            x_combined = alpha * x[:, N_ctxt:] + (1-alpha) * x_pred_dynamic
+            x = torch.cat([x[:, :N_ctxt], x_combined], dim=1)
+        
+        # 最后的norm和projection保持不变
+        x = self.predictor_norm(x)
+        x = x[:, N_ctxt:]
+        x = self.predictor_proj(x)          
 
         return x
 

@@ -1,0 +1,69 @@
+# configs/pretrain/vjepa_action_strategy1.yaml
+app: vjepa
+nodes: 16
+tasks_per_node: 8
+data:
+  dataset_type: ActionVideoDataset  # 修改为动作视频数据集
+  datasets:
+    - /cephfs/chenshuaixing/data/libero_video/libero_10/libero_train.csv
+  action_paths:  # 新增：动作数据路径
+    - /cephfs/chenshuaixing/data/libero_action_data/libero_train_with_actions.csv
+  decode_one_clip: true
+  batch_size: 24
+  num_clips: 1
+  num_frames: 16
+  tubelet_size: 2
+  sampling_rate: 4
+  crop_size: 224
+  patch_size: 16
+  pin_mem: true
+  num_workers: 12
+  filter_short_videos: false
+  clip_duration: null
+
+mask:
+  - aspect_ratio:
+      - 0.75
+      - 1.5
+    num_blocks: 8
+    spatial_scale:
+      - 0.15
+      - 0.15
+    temporal_scale:
+      - 1.0
+      - 1.0
+    max_temporal_keep: 1.0
+    max_keep: null
+
+model:
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 384
+  uniform_power: true
+  use_mask_tokens: true
+  zero_init_mask_tokens: true
+  # 新增：动态模型配置
+  use_dynamics: true
+  action_dim: 7  # 根据你的动作维度调整
+  dynamics_type: "mlp"
+  dynamics_hidden_dim: 256
+  dynamics_layers: 2
+
+optimization:
+  ipe: 300
+  ipe_scale: 1.25
+  clip_grad: 10.0
+  weight_decay: 0.04
+  final_weight_decay: 0.4
+  epochs: 300
+  warmup: 40
+  start_lr: 0.0002
+  lr: 0.000625
+  final_lr: 1.0e-06
+  ema:
+  - 0.998
+  - 1.0
+
+logging:
+  folder: /cephfs/chenshuaixing/vjepa_logs/libero_kitchen/
+  write_tag: jepa_action_strategy1
